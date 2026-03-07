@@ -1,5 +1,6 @@
 mod app;
 mod bridge;
+mod query_window;
 mod table_view;
 
 fn main() -> eframe::Result {

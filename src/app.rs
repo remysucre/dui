@@ -1,4 +1,5 @@
 use crate::bridge;
+use crate::query_window::QueryWindow;
 use crate::table_view::TableWindow;
 use duckdb::Connection;
 use eframe::egui;
@@ -6,6 +7,8 @@ use eframe::egui;
 pub struct DuiApp {
     conn: Connection,
     tables: Vec<TableWindow>,
+    query_windows: Vec<QueryWindow>,
+    next_query_id: usize,
     error: Option<String>,
 }
 
@@ -14,6 +17,8 @@ impl DuiApp {
         Self {
             conn: Connection::open_in_memory().expect("Failed to open DuckDB"),
             tables: Vec::new(),
+            query_windows: Vec::new(),
+            next_query_id: 1,
             error: None,
         }
     }
@@ -51,8 +56,23 @@ impl eframe::App for DuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
 
+        // Top menu bar
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                if ui.button("Query").clicked() {
+                    let id = self.next_query_id;
+                    self.next_query_id += 1;
+                    self.query_windows.push(QueryWindow::new(id));
+                }
+            });
+        });
+
         // Render all table windows
         self.tables.retain_mut(|tw| tw.show(ctx));
+
+        // Render all query windows
+        self.query_windows
+            .retain_mut(|qw| qw.show(ctx, &self.conn));
 
         let has_tables = !self.tables.is_empty();
 

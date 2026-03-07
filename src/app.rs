@@ -1,8 +1,10 @@
-use crate::bridge::TableData;
+use crate::bridge;
 use crate::table_view::TableWindow;
+use duckdb::Connection;
 use eframe::egui;
 
 pub struct DuiApp {
+    conn: Connection,
     tables: Vec<TableWindow>,
     error: Option<String>,
 }
@@ -10,6 +12,7 @@ pub struct DuiApp {
 impl DuiApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
+            conn: Connection::open_in_memory().expect("Failed to open DuckDB"),
             tables: Vec::new(),
             error: None,
         }
@@ -20,23 +23,11 @@ impl DuiApp {
             ctx.input(|i| i.raw.dropped_files.clone());
 
         for file in dropped_files {
-            let name = if !file.name.is_empty() {
-                file.name.clone()
-            } else if let Some(path) = &file.path {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            } else {
-                continue;
-            };
-
-            let bytes = if let Some(bytes) = &file.bytes {
-                bytes.to_vec()
-            } else if let Some(path) = &file.path {
-                match std::fs::read(path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.error = Some(format!("{name}: {e}"));
+            let path = if let Some(path) = &file.path {
+                match path.to_str() {
+                    Some(p) => p.to_string(),
+                    None => {
+                        self.error = Some("Invalid file path".to_string());
                         continue;
                     }
                 }
@@ -44,12 +35,12 @@ impl DuiApp {
                 continue;
             };
 
-            match TableData::from_csv(&bytes) {
-                Ok(data) => {
+            match bridge::load_file(&self.conn, &path) {
+                Ok((name, data)) => {
                     self.tables.push(TableWindow::new(name, data));
                 }
                 Err(e) => {
-                    self.error = Some(format!("{name}: {e}"));
+                    self.error = Some(e);
                 }
             }
         }
@@ -80,7 +71,7 @@ impl eframe::App for DuiApp {
                     ui.add_space(ui.available_height() / 3.0);
                     ui.heading("dui");
                     ui.add_space(8.0);
-                    ui.label("Drop a CSV file here");
+                    ui.label("Drop a data file here");
                 });
             }
         });
@@ -102,7 +93,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
         painter.text(
             screen_rect.center(),
             Align2::CENTER_CENTER,
-            "Drop CSV file to load",
+            "Drop file to load",
             TextStyle::Heading.resolve(&ctx.style()),
             Color32::WHITE,
         );

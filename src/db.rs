@@ -23,6 +23,27 @@ impl QueryResult {
 pub trait Db {
     fn execute(&self, sql: &str) -> Result<(), String>;
     fn query(&self, sql: &str) -> Result<QueryResult, String>;
+    fn is_ready(&self) -> bool {
+        true
+    }
+    fn init_error(&self) -> Option<String> {
+        None
+    }
+
+    /// Run a batch of statements, then optionally run a final query.
+    /// Returns the query result (or empty if no final query).
+    /// On native this just runs them sequentially. On WASM this sends
+    /// the whole batch to JS in one async call so ordering is preserved.
+    fn batch(&self, stmts: &[String], final_query: Option<&str>) -> Result<QueryResult, String> {
+        for sql in stmts {
+            self.execute(sql)?;
+        }
+        if let Some(q) = final_query {
+            self.query(q)
+        } else {
+            Ok(QueryResult::default())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -47,9 +68,7 @@ mod native {
 
     impl Db for NativeDb {
         fn execute(&self, sql: &str) -> Result<(), String> {
-            self.conn
-                .execute_batch(sql)
-                .map_err(|e| format!("{e}"))
+            self.conn.execute_batch(sql).map_err(|e| format!("{e}"))
         }
 
         fn query(&self, sql: &str) -> Result<QueryResult, String> {
@@ -81,11 +100,7 @@ mod native {
                 rows.push(vals);
             }
 
-            Ok(QueryResult {
-                columns,
-                rows,
-                row_ids,
-            })
+            Ok(QueryResult { columns, rows, row_ids })
         }
     }
 
@@ -114,16 +129,26 @@ mod native {
 pub use native::NativeDb;
 
 // ---------------------------------------------------------------------------
-// WASM implementation — calls JS globals via eframe's re-exported wasm-bindgen
+// WASM implementation
+//
+// duckdb-wasm is fully async (Worker-based). egui update() is synchronous.
+//
+// Strategy:
+// - execute(): fire-and-forget via spawn_local
+// - query(): spawns async call, caches result, returns cached or empty
+// - batch(): spawns a single async call for multiple stmts + final query,
+//   preserving execution order
 // ---------------------------------------------------------------------------
 #[cfg(target_arch = "wasm32")]
 mod wasm {
     use super::*;
     use eframe::wasm_bindgen::prelude::*;
     use eframe::wasm_bindgen::JsCast;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::rc::Rc;
 
-    /// Call a global JS function by name with a single string argument, returning a string.
-    fn call_js(fn_name: &str, arg: &str) -> Result<String, String> {
+    fn call_js_sync(fn_name: &str, arg: &str) -> Result<String, String> {
         let window = eframe::web_sys::window().ok_or("no window")?;
         let func = js_sys::Reflect::get(&window, &JsValue::from_str(fn_name))
             .map_err(|_| format!("JS function {fn_name} not found"))?;
@@ -138,30 +163,147 @@ mod wasm {
             .ok_or_else(|| "JS function did not return a string".to_string())
     }
 
-    pub struct WasmDb;
+    fn call_js_async_raw(fn_name: &str, arg: &str) -> Result<js_sys::Promise, String> {
+        let window = eframe::web_sys::window().ok_or("no window")?;
+        let func = js_sys::Reflect::get(&window, &JsValue::from_str(fn_name))
+            .map_err(|_| format!("JS function {fn_name} not found"))?;
+        let func: js_sys::Function = func
+            .dyn_into()
+            .map_err(|_| format!("{fn_name} is not a function"))?;
+        let result = func
+            .call1(&JsValue::NULL, &JsValue::from_str(arg))
+            .map_err(|e| format!("JS call failed: {e:?}"))?;
+        result
+            .dyn_into::<js_sys::Promise>()
+            .map_err(|_| "JS function did not return a Promise".to_string())
+    }
+
+    type ResultSlot = Rc<RefCell<Option<Result<String, String>>>>;
+
+    fn spawn_js_call(fn_name: &'static str, arg: String, slot: ResultSlot) {
+        let promise = match call_js_async_raw(fn_name, &arg) {
+            Ok(p) => p,
+            Err(e) => {
+                *slot.borrow_mut() = Some(Err(e));
+                return;
+            }
+        };
+        let future = wasm_bindgen_futures::JsFuture::from(promise);
+        wasm_bindgen_futures::spawn_local(async move {
+            match future.await {
+                Ok(val) => {
+                    let s = val.as_string().unwrap_or_default();
+                    if s.starts_with("ERROR:") {
+                        *slot.borrow_mut() = Some(Err(s[6..].trim().to_string()));
+                    } else {
+                        *slot.borrow_mut() = Some(Ok(s));
+                    }
+                }
+                Err(e) => {
+                    *slot.borrow_mut() = Some(Err(format!("JS promise rejected: {e:?}")));
+                }
+            }
+        });
+    }
+
+    pub struct WasmDb {
+        query_cache: RefCell<HashMap<String, ResultSlot>>,
+    }
 
     impl WasmDb {
         pub fn new() -> Self {
-            Self
+            Self {
+                query_cache: RefCell::new(HashMap::new()),
+            }
         }
+
     }
 
     impl Db for WasmDb {
+        fn is_ready(&self) -> bool {
+            call_js_sync("_ddb_is_ready", "")
+                .map(|s| s == "true")
+                .unwrap_or(false)
+        }
+
+        fn init_error(&self) -> Option<String> {
+            call_js_sync("_ddb_get_init_error", "")
+                .ok()
+                .filter(|s| !s.is_empty())
+        }
+
         fn execute(&self, sql: &str) -> Result<(), String> {
-            let res = call_js("_ddb_exec", sql)?;
-            if res.starts_with("ERROR:") {
-                Err(res[6..].trim().to_string())
-            } else {
-                Ok(())
+            if !self.is_ready() {
+                return Err("Database is loading...".to_string());
             }
+            let slot: ResultSlot = Rc::new(RefCell::new(None));
+            spawn_js_call("_ddb_exec_async", sql.to_string(), slot);
+            Ok(())
         }
 
         fn query(&self, sql: &str) -> Result<QueryResult, String> {
-            let json = call_js("_ddb_query", sql)?;
-            if json.starts_with("ERROR:") {
-                return Err(json[6..].trim().to_string());
+            if !self.is_ready() {
+                return Err("Database is loading...".to_string());
             }
-            serde_json::from_str(&json).map_err(|e| format!("JSON parse error: {e}"))
+
+            let mut cache = self.query_cache.borrow_mut();
+
+            if let Some(slot) = cache.get(sql) {
+                let result = slot.borrow_mut().take();
+                if let Some(res) = result {
+                    cache.remove(sql);
+                    return match res {
+                        Ok(json) => serde_json::from_str(&json)
+                            .map_err(|e| format!("JSON parse error: {e}")),
+                        Err(e) => Err(e),
+                    };
+                }
+                // Still pending
+                return Ok(QueryResult::default());
+            }
+
+            let slot: ResultSlot = Rc::new(RefCell::new(None));
+            cache.insert(sql.to_string(), slot.clone());
+            spawn_js_call("_ddb_query_async", sql.to_string(), slot);
+            Ok(QueryResult::default())
+        }
+
+        fn batch(
+            &self,
+            stmts: &[String],
+            final_query: Option<&str>,
+        ) -> Result<QueryResult, String> {
+            if !self.is_ready() {
+                return Err("Database is loading...".to_string());
+            }
+
+            // Build the JSON payload for _ddb_batch_async
+            let input = serde_json::json!({
+                "stmts": stmts,
+                "query": final_query.unwrap_or(""),
+            });
+            let key = format!("__batch__{}", input);
+
+            let mut cache = self.query_cache.borrow_mut();
+
+            if let Some(slot) = cache.get(&key) {
+                let result = slot.borrow_mut().take();
+                if let Some(res) = result {
+                    cache.remove(&key);
+                    return match res {
+                        Ok(json) if json == "OK" => Ok(QueryResult::default()),
+                        Ok(json) => serde_json::from_str(&json)
+                            .map_err(|e| format!("JSON parse error: {e}")),
+                        Err(e) => Err(e),
+                    };
+                }
+                return Ok(QueryResult::default());
+            }
+
+            let slot: ResultSlot = Rc::new(RefCell::new(None));
+            cache.insert(key, slot.clone());
+            spawn_js_call("_ddb_batch_async", input.to_string(), slot);
+            Ok(QueryResult::default())
         }
     }
 }

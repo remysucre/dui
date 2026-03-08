@@ -10,6 +10,8 @@ pub struct DuiApp {
     next_table_id: usize,
     query_windows: Vec<QueryWindow>,
     error: Option<String>,
+    /// Pending CSV loads waiting for async batch results (WASM)
+    pending_loads: Vec<bridge::CsvLoadPlan>,
 }
 
 impl DuiApp {
@@ -30,10 +32,14 @@ impl DuiApp {
             next_table_id: 1,
             query_windows: Vec::new(),
             error: None,
+            pending_loads: Vec::new(),
         }
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        if !self.db.is_ready() {
+            return;
+        }
         let dropped_files: Vec<egui::DroppedFile> =
             ctx.input(|i| i.raw.dropped_files.clone());
 
@@ -78,9 +84,21 @@ impl DuiApp {
                     }
                 };
                 let name_hint = file.name.strip_suffix(".csv").unwrap_or(&file.name);
-                match bridge::load_csv_bytes(self.db.as_ref(), name_hint, &csv_text) {
-                    Ok((name, data)) => {
-                        self.tables.push(TableWindow::new(name, data));
+                match bridge::prepare_csv_load(name_hint, &csv_text) {
+                    Ok(plan) => {
+                        match self.db.batch(&plan.stmts, Some(&plan.final_query)) {
+                            Ok(result) if !result.columns.is_empty() => {
+                                let data = bridge::parse_rowid_result(result);
+                                self.tables.push(TableWindow::new(plan.name, data));
+                            }
+                            Ok(_) => {
+                                // WASM: result pending, poll next frame
+                                self.pending_loads.push(plan);
+                            }
+                            Err(e) => {
+                                self.error = Some(e);
+                            }
+                        }
                     }
                     Err(e) => {
                         self.error = Some(e);
@@ -94,6 +112,26 @@ impl DuiApp {
 impl eframe::App for DuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
+
+        // Poll pending CSV loads (WASM async)
+        let mut completed_loads = Vec::new();
+        for (idx, plan) in self.pending_loads.iter().enumerate() {
+            match self.db.batch(&plan.stmts, Some(&plan.final_query)) {
+                Ok(result) if !result.columns.is_empty() => {
+                    let data = bridge::parse_rowid_result(result);
+                    self.tables.push(TableWindow::new(plan.name.clone(), data));
+                    completed_loads.push(idx);
+                }
+                Ok(_) => { ctx.request_repaint(); }
+                Err(e) => {
+                    self.error = Some(e);
+                    completed_loads.push(idx);
+                }
+            }
+        }
+        for idx in completed_loads.into_iter().rev() {
+            self.pending_loads.remove(idx);
+        }
 
         // Render all table windows (keep closed ones for the side panel)
         for tw in &mut self.tables {
@@ -241,7 +279,19 @@ impl eframe::App for DuiApp {
                     ui.add_space(ui.available_height() / 3.0);
                     ui.heading("dui");
                     ui.add_space(8.0);
-                    ui.label("Drop a data file here");
+                    if !self.db.is_ready() {
+                        if let Some(err) = self.db.init_error() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 100, 100),
+                                format!("Database init failed: {err}"),
+                            );
+                        } else {
+                            ui.label("Initializing database...");
+                            ctx.request_repaint();
+                        }
+                    } else {
+                        ui.label("Drop a data file here");
+                    }
                 });
             }
         });

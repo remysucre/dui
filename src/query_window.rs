@@ -10,6 +10,8 @@ pub struct QueryWindow {
     query: String,
     result: Option<Result<TableData, String>>,
     pub open: bool,
+    /// Pending async query being polled
+    pending_query: Option<String>,
 }
 
 impl QueryWindow {
@@ -21,6 +23,7 @@ impl QueryWindow {
             query: String::new(),
             result: None,
             open: true,
+            pending_query: None,
         }
     }
 
@@ -29,8 +32,26 @@ impl QueryWindow {
         if !self.open {
             return false;
         }
+
+        // Poll pending async query
+        let mut ran_from_poll = false;
+        if let Some(sql) = self.pending_query.clone() {
+            match db.query(&sql) {
+                Ok(result) if !result.columns.is_empty() => {
+                    self.result = Some(Ok(result.into_table_data()));
+                    self.pending_query = None;
+                    ran_from_poll = true;
+                }
+                Ok(_) => { ctx.request_repaint(); }
+                Err(e) => {
+                    self.result = Some(Err(e));
+                    self.pending_query = None;
+                }
+            }
+        }
+
         let mut open = self.open;
-        let ran = std::cell::Cell::new(false);
+        let ran = std::cell::Cell::new(ran_from_poll);
         let window_frame = egui::Frame::window(&ctx.style())
             .inner_margin(egui::Margin::same(2));
         egui::Window::new(&self.name)
@@ -54,8 +75,20 @@ impl QueryWindow {
                 );
 
                 if ui.button("Run").clicked() {
-                    self.result = Some(run_query(db, &self.query));
-                    ran.set(true);
+                    match run_query(db, &self.query) {
+                        Ok(data) if !data.columns.is_empty() => {
+                            self.result = Some(Ok(data));
+                            ran.set(true);
+                        }
+                        Ok(_) => {
+                            // WASM: result pending, poll next frame
+                            self.pending_query = Some(self.query.clone());
+                            self.result = None;
+                        }
+                        Err(e) => {
+                            self.result = Some(Err(e));
+                        }
+                    }
                 }
 
                 ui.separator();

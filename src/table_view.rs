@@ -25,6 +25,8 @@ pub struct TableWindow {
     editing_cell: Option<(usize, usize)>,
     /// Column being renamed: (col_index, old_name)
     editing_col: Option<(usize, String)>,
+    /// Pending async batch operation: (stmts, final_query)
+    pending_batch: Option<(Vec<String>, String)>,
 }
 
 static NEXT_TABLE_WINDOW_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -40,6 +42,7 @@ impl TableWindow {
             renaming: false,
             editing_cell: None,
             editing_col: None,
+            pending_batch: None,
         }
     }
 
@@ -63,8 +66,18 @@ impl TableWindow {
     }
 
     pub fn refresh(&mut self, db: &dyn Db) {
-        if let Ok(data) = bridge::read_table(db, &self.name) {
-            self.data = data;
+        if self.pending_batch.is_some() {
+            return;
+        }
+        let query = format!("SELECT rowid, * FROM \"{}\" LIMIT 10000", self.name);
+        match db.batch(&[], Some(&query)) {
+            Ok(result) if !result.columns.is_empty() => {
+                self.data = bridge::parse_rowid_result(result);
+            }
+            Ok(_) => {
+                self.pending_batch = Some((vec![], query));
+            }
+            Err(_) => {}
         }
     }
 
@@ -95,6 +108,18 @@ impl TableWindow {
 
     /// Render this table as a floating egui::Window. Returns false if closed.
     pub fn show(&mut self, ctx: &egui::Context, db: &dyn Db) -> bool {
+        // Poll pending async batch operation
+        if let Some((stmts, query)) = self.pending_batch.clone() {
+            match db.batch(&stmts, Some(&query)) {
+                Ok(result) if !result.columns.is_empty() => {
+                    self.data = bridge::parse_rowid_result(result);
+                    self.pending_batch = None;
+                }
+                Ok(_) => { ctx.request_repaint(); }
+                Err(_) => { self.pending_batch = None; }
+            }
+        }
+
         let mut open = self.open;
         let width = self.estimate_width(ctx);
 
@@ -268,49 +293,58 @@ impl TableWindow {
             }
         }
 
-        // Execute structural actions
+        // Execute structural actions using batch to preserve ordering
         for action in actions {
-            match action {
+            let mutation_sql = match &action {
                 TableAction::AddColumn => {
                     let new_col = format!("col_{}", self.data.columns.len());
-                    let sql = format!(
+                    format!(
                         "ALTER TABLE \"{}\" ADD COLUMN \"{}\" VARCHAR",
                         self.name, new_col
-                    );
-                    let _ = db.execute(&sql);
-                    self.refresh(db);
+                    )
                 }
                 TableAction::DropColumn(ci) => {
-                    if let Some(col) = self.data.columns.get(ci) {
-                        let sql = format!(
+                    if let Some(col) = self.data.columns.get(*ci) {
+                        format!(
                             "ALTER TABLE \"{}\" DROP COLUMN \"{}\"",
                             self.name, col
-                        );
-                        let _ = db.execute(&sql);
-                        self.refresh(db);
+                        )
+                    } else {
+                        continue;
                     }
                 }
                 TableAction::RenameColumn(_ci, old, new) => {
-                    let sql = format!(
+                    format!(
                         "ALTER TABLE \"{}\" RENAME COLUMN \"{}\" TO \"{}\"",
                         self.name, old, new
-                    );
-                    let _ = db.execute(&sql);
-                    self.refresh(db);
+                    )
                 }
                 TableAction::AddRow => {
-                    let sql = format!("INSERT INTO \"{}\" DEFAULT VALUES", self.name);
-                    let _ = db.execute(&sql);
-                    self.refresh(db);
+                    format!("INSERT INTO \"{}\" DEFAULT VALUES", self.name)
                 }
                 TableAction::DeleteRow(rid) => {
-                    let sql = format!(
+                    format!(
                         "DELETE FROM \"{}\" WHERE rowid = {}",
                         self.name, rid
-                    );
-                    let _ = db.execute(&sql);
-                    self.refresh(db);
+                    )
                 }
+            };
+
+            // Use batch: run mutation then re-query the table
+            let refresh_query = format!(
+                "SELECT rowid, * FROM \"{}\" LIMIT 10000",
+                self.name
+            );
+            let stmts = vec![mutation_sql];
+            match db.batch(&stmts, Some(&refresh_query)) {
+                Ok(result) if !result.columns.is_empty() => {
+                    self.data = bridge::parse_rowid_result(result);
+                }
+                Ok(_) => {
+                    // WASM: result pending, poll next frame
+                    self.pending_batch = Some((stmts, refresh_query));
+                }
+                Err(_) => {}
             }
         }
 

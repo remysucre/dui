@@ -1,4 +1,4 @@
-use crate::db::Db;
+use crate::db::{Db, QueryResult};
 
 /// Parsed table data from a file.
 #[derive(Debug, Clone)]
@@ -16,7 +16,6 @@ pub fn load_file(db: &dyn Db, path: &str) -> Result<(String, TableData), String>
         .and_then(|n| n.to_str())
         .unwrap_or("table");
 
-    // Derive a safe table name from the file name (strip extension, replace non-alnum)
     let safe_name: String = std::path::Path::new(file_name)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -25,10 +24,8 @@ pub fn load_file(db: &dyn Db, path: &str) -> Result<(String, TableData), String>
         .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
 
-    // Deduplicate: if the table already exists, append a suffix
     let table_name = dedup_table_name(db, &safe_name);
 
-    // Ingest the file
     db.execute(&format!(
         "CREATE TABLE \"{table_name}\" AS SELECT * FROM read_csv_auto('{path}')"
     ))
@@ -37,31 +34,34 @@ pub fn load_file(db: &dyn Db, path: &str) -> Result<(String, TableData), String>
     read_table(db, &table_name).map(|data| (table_name, data))
 }
 
-/// Load CSV bytes directly (used in WASM where we only have bytes, not file paths).
-pub fn load_csv_bytes(db: &dyn Db, name_hint: &str, csv: &str) -> Result<(String, TableData), String> {
+/// Plan for loading CSV data, built without executing any SQL.
+pub struct CsvLoadPlan {
+    pub name: String,
+    pub stmts: Vec<String>,
+    pub final_query: String,
+}
+
+/// Build SQL statements for loading CSV data without executing them.
+pub fn prepare_csv_load(name_hint: &str, csv: &str) -> Result<CsvLoadPlan, String> {
     let safe_name: String = name_hint
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
     let safe_name = if safe_name.is_empty() { "table".to_string() } else { safe_name };
 
-    let table_name = dedup_table_name(db, &safe_name);
-
-    // Parse CSV header + rows manually
     let mut lines = csv.lines();
     let header = lines.next().ok_or("CSV is empty")?;
     let columns: Vec<&str> = header.split(',').map(|s| s.trim()).collect();
 
-    // Create table
-    let col_defs: Vec<String> = columns.iter().map(|c| format!("\"{}\" VARCHAR", c)).collect();
-    db.execute(&format!(
-        "CREATE TABLE \"{}\" ({})",
-        table_name,
-        col_defs.join(", ")
-    ))
-    .map_err(|e| format!("Failed to create table: {e}"))?;
+    let mut stmts = Vec::new();
 
-    // Insert rows
+    let col_defs: Vec<String> = columns.iter().map(|c| format!("\"{}\" VARCHAR", c)).collect();
+    stmts.push(format!(
+        "CREATE TABLE \"{}\" ({})",
+        safe_name,
+        col_defs.join(", ")
+    ));
+
     for line in lines {
         if line.trim().is_empty() {
             continue;
@@ -73,17 +73,36 @@ pub fn load_csv_bytes(db: &dyn Db, name_hint: &str, csv: &str) -> Result<(String
                 format!("'{}'", s.replace('\'', "''"))
             })
             .collect();
-        db.execute(&format!(
+        stmts.push(format!(
             "INSERT INTO \"{}\" VALUES ({})",
-            table_name,
+            safe_name,
             vals.join(", ")
-        ))
-        .map_err(|e| format!("Failed to insert row: {e}"))?;
+        ));
     }
 
-    read_table(db, &table_name).map(|data| (table_name, data))
+    let final_query = format!("SELECT rowid, * FROM \"{}\" LIMIT 10000", safe_name);
+
+    Ok(CsvLoadPlan { name: safe_name, stmts, final_query })
 }
 
+/// Parse a query result that includes rowid as the first column.
+pub fn parse_rowid_result(result: QueryResult) -> TableData {
+    if result.columns.is_empty() {
+        return TableData { columns: vec![], rows: vec![], row_ids: vec![] };
+    }
+    let columns = result.columns[1..].to_vec();
+    let mut rows = Vec::new();
+    let mut row_ids = Vec::new();
+    for row in &result.rows {
+        if let Some(rid_str) = row.first() {
+            row_ids.push(rid_str.parse().unwrap_or(0));
+            rows.push(row[1..].to_vec());
+        }
+    }
+    TableData { columns, rows, row_ids }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn dedup_table_name(db: &dyn Db, safe_name: &str) -> String {
     let mut name = safe_name.to_string();
     let mut suffix = 1u32;
@@ -109,7 +128,6 @@ fn dedup_table_name(db: &dyn Db, safe_name: &str) -> String {
 
 /// Read all data from a table (columns + rows with rowid).
 pub fn read_table(db: &dyn Db, table_name: &str) -> Result<TableData, String> {
-    // Get column names
     let col_result = db.query(&format!("PRAGMA table_info('{table_name}')"))?;
     let columns: Vec<String> = col_result
         .rows
@@ -117,7 +135,15 @@ pub fn read_table(db: &dyn Db, table_name: &str) -> Result<TableData, String> {
         .filter_map(|row| row.get(1).cloned())
         .collect();
 
-    // Read rows with rowid
+    if columns.is_empty() {
+        // On WASM, the query might not have resolved yet — return empty
+        return Ok(TableData {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_ids: Vec::new(),
+        });
+    }
+
     let col_list: String = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
     let data_result = db.query(&format!(
         "SELECT rowid, {col_list} FROM \"{table_name}\" LIMIT 10000"

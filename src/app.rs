@@ -9,6 +9,7 @@ pub struct DuiApp {
     tables: Vec<TableWindow>,
     query_windows: Vec<QueryWindow>,
     next_query_id: usize,
+    show_tables_pane: bool,
     error: Option<String>,
 }
 
@@ -19,6 +20,7 @@ impl DuiApp {
             tables: Vec::new(),
             query_windows: Vec::new(),
             next_query_id: 1,
+            show_tables_pane: false,
             error: None,
         }
     }
@@ -64,17 +66,58 @@ impl eframe::App for DuiApp {
                     self.next_query_id += 1;
                     self.query_windows.push(QueryWindow::new(id));
                 }
+                if ui
+                    .selectable_label(self.show_tables_pane, "Tables")
+                    .clicked()
+                {
+                    self.show_tables_pane = !self.show_tables_pane;
+                }
             });
         });
 
-        // Render all table windows
-        self.tables.retain_mut(|tw| tw.show(ctx));
+        // Render all table windows (keep closed ones for the side panel)
+        for tw in &mut self.tables {
+            tw.show(ctx);
+        }
 
         // Render all query windows
-        self.query_windows
-            .retain_mut(|qw| qw.show(ctx, &self.conn));
+        let mut any_query_ran = false;
+        self.query_windows.retain_mut(|qw| {
+            let (open, ran) = qw.show(ctx, &self.conn);
+            if ran {
+                any_query_ran = true;
+            }
+            open
+        });
 
-        let has_tables = !self.tables.is_empty();
+        // Refresh table data after a query modifies the database
+        if any_query_ran {
+            for tw in &mut self.tables {
+                tw.refresh(&self.conn);
+            }
+        }
+
+        // Right side panel: table list
+        if self.show_tables_pane {
+            egui::SidePanel::right("tables_pane")
+                .default_width(160.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.heading("Tables");
+                    ui.separator();
+                    for tw in &mut self.tables {
+                        let label = ui.selectable_label(tw.open, &tw.name);
+                        if label.clicked() {
+                            tw.open = !tw.open;
+                        }
+                    }
+                    if self.tables.is_empty() {
+                        ui.weak("No tables loaded");
+                    }
+                });
+        }
+
+        let has_tables = self.tables.iter().any(|tw| tw.open);
 
         // Central panel: drop zone hint when no tables are open
         egui::CentralPanel::default().show(ctx, |ui| {

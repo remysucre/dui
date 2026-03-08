@@ -87,7 +87,7 @@ pub fn load_file(conn: &Connection, path: &str) -> Result<(String, TableData), S
     Ok((table_name, TableData { columns, rows }))
 }
 
-fn format_value(v: &duckdb::types::Value) -> String {
+pub fn format_value(v: &duckdb::types::Value) -> String {
     match v {
         duckdb::types::Value::Null => String::new(),
         duckdb::types::Value::Boolean(b) => b.to_string(),

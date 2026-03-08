@@ -1,4 +1,4 @@
-use duckdb::Connection;
+use crate::db::Db;
 
 /// Parsed table data from a file.
 #[derive(Debug, Clone)]
@@ -9,7 +9,8 @@ pub struct TableData {
 }
 
 /// Load a file into DuckDB and return the table name and parsed data.
-pub fn load_file(conn: &Connection, path: &str) -> Result<(String, TableData), String> {
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_file(db: &dyn Db, path: &str) -> Result<(String, TableData), String> {
     let file_name = std::path::Path::new(path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -25,78 +26,119 @@ pub fn load_file(conn: &Connection, path: &str) -> Result<(String, TableData), S
         .collect();
 
     // Deduplicate: if the table already exists, append a suffix
-    let table_name = {
-        let mut name = safe_name.clone();
-        let mut suffix = 1u32;
-        loop {
-            let exists: bool = conn
-                .prepare(&format!(
-                    "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{name}'"
-                ))
-                .and_then(|mut stmt| stmt.query_row([], |row| row.get::<_, i64>(0)))
-                .map(|count| count > 0)
-                .unwrap_or(false);
-            if !exists {
-                break name;
-            }
-            suffix += 1;
-            name = format!("{safe_name}_{suffix}");
-        }
-    };
+    let table_name = dedup_table_name(db, &safe_name);
 
     // Ingest the file
-    conn.execute_batch(&format!(
+    db.execute(&format!(
         "CREATE TABLE \"{table_name}\" AS SELECT * FROM read_csv_auto('{path}')"
     ))
     .map_err(|e| format!("Failed to load file: {e}"))?;
 
-    // Get column names
-    let columns: Vec<String> = {
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info('{table_name}')"))
-            .map_err(|e| format!("Failed to get table info: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("Failed to read columns: {e}"))?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
+    read_table(db, &table_name).map(|data| (table_name, data))
+}
 
-    // Read rows (up to 10 000) with rowid
-    let col_count = columns.len();
-    let mut rows: Vec<Vec<String>> = Vec::new();
-    let mut row_ids: Vec<i64> = Vec::new();
-    {
-        let mut stmt = conn
-            .prepare(&format!(
-                "SELECT rowid, * FROM \"{table_name}\" LIMIT 10000"
-            ))
-            .map_err(|e| format!("Failed to query rows: {e}"))?;
-        let mapped = stmt
-            .query_map([], |row| {
-                let rid: i64 = row.get(0)?;
-                let mut vals = Vec::with_capacity(col_count);
-                for i in 0..col_count {
-                    let val: String = row
-                        .get::<_, duckdb::types::Value>(i + 1)
-                        .map(|v| format_value(&v))
-                        .unwrap_or_default();
-                    vals.push(val);
-                }
-                Ok((rid, vals))
+/// Load CSV bytes directly (used in WASM where we only have bytes, not file paths).
+pub fn load_csv_bytes(db: &dyn Db, name_hint: &str, csv: &str) -> Result<(String, TableData), String> {
+    let safe_name: String = name_hint
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let safe_name = if safe_name.is_empty() { "table".to_string() } else { safe_name };
+
+    let table_name = dedup_table_name(db, &safe_name);
+
+    // Parse CSV header + rows manually
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or("CSV is empty")?;
+    let columns: Vec<&str> = header.split(',').map(|s| s.trim()).collect();
+
+    // Create table
+    let col_defs: Vec<String> = columns.iter().map(|c| format!("\"{}\" VARCHAR", c)).collect();
+    db.execute(&format!(
+        "CREATE TABLE \"{}\" ({})",
+        table_name,
+        col_defs.join(", ")
+    ))
+    .map_err(|e| format!("Failed to create table: {e}"))?;
+
+    // Insert rows
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let vals: Vec<String> = line
+            .split(',')
+            .map(|s| {
+                let s = s.trim();
+                format!("'{}'", s.replace('\'', "''"))
             })
-            .map_err(|e| format!("Failed to read rows: {e}"))?;
-        for r in mapped.flatten() {
-            row_ids.push(r.0);
-            rows.push(r.1);
+            .collect();
+        db.execute(&format!(
+            "INSERT INTO \"{}\" VALUES ({})",
+            table_name,
+            vals.join(", ")
+        ))
+        .map_err(|e| format!("Failed to insert row: {e}"))?;
+    }
+
+    read_table(db, &table_name).map(|data| (table_name, data))
+}
+
+fn dedup_table_name(db: &dyn Db, safe_name: &str) -> String {
+    let mut name = safe_name.to_string();
+    let mut suffix = 1u32;
+    loop {
+        let exists = db
+            .query(&format!(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{name}'"
+            ))
+            .map(|r| {
+                r.rows.first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0) > 0
+            })
+            .unwrap_or(false);
+        if !exists {
+            break name;
+        }
+        suffix += 1;
+        name = format!("{safe_name}_{suffix}");
+    }
+}
+
+/// Read all data from a table (columns + rows with rowid).
+pub fn read_table(db: &dyn Db, table_name: &str) -> Result<TableData, String> {
+    // Get column names
+    let col_result = db.query(&format!("PRAGMA table_info('{table_name}')"))?;
+    let columns: Vec<String> = col_result
+        .rows
+        .iter()
+        .filter_map(|row| row.get(1).cloned())
+        .collect();
+
+    // Read rows with rowid
+    let col_list: String = columns.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let data_result = db.query(&format!(
+        "SELECT rowid, {col_list} FROM \"{table_name}\" LIMIT 10000"
+    ))?;
+
+    let mut rows = Vec::new();
+    let mut row_ids = Vec::new();
+    for row in &data_result.rows {
+        if let Some(rid_str) = row.first() {
+            let rid: i64 = rid_str.parse().unwrap_or(0);
+            row_ids.push(rid);
+            rows.push(row[1..].to_vec());
         }
     }
 
-    Ok((table_name, TableData { columns, rows, row_ids }))
+    Ok(TableData { columns, rows, row_ids })
 }
 
 /// Create an empty table with a single column.
-pub fn create_empty_table(conn: &Connection, name: &str) -> Result<TableData, String> {
-    conn.execute_batch(&format!(
+pub fn create_empty_table(db: &dyn Db, name: &str) -> Result<TableData, String> {
+    db.execute(&format!(
         "CREATE TABLE \"{name}\" (value VARCHAR)"
     ))
     .map_err(|e| format!("Failed to create table: {e}"))?;
@@ -108,27 +150,7 @@ pub fn create_empty_table(conn: &Connection, name: &str) -> Result<TableData, St
 }
 
 /// Drop a table from DuckDB.
-pub fn drop_table(conn: &Connection, name: &str) -> Result<(), String> {
-    conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{name}\""))
+pub fn drop_table(db: &dyn Db, name: &str) -> Result<(), String> {
+    db.execute(&format!("DROP TABLE IF EXISTS \"{name}\""))
         .map_err(|e| format!("Failed to drop table: {e}"))
-}
-
-pub fn format_value(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => String::new(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(n) => n.to_string(),
-        duckdb::types::Value::SmallInt(n) => n.to_string(),
-        duckdb::types::Value::Int(n) => n.to_string(),
-        duckdb::types::Value::BigInt(n) => n.to_string(),
-        duckdb::types::Value::HugeInt(n) => n.to_string(),
-        duckdb::types::Value::UTinyInt(n) => n.to_string(),
-        duckdb::types::Value::USmallInt(n) => n.to_string(),
-        duckdb::types::Value::UInt(n) => n.to_string(),
-        duckdb::types::Value::UBigInt(n) => n.to_string(),
-        duckdb::types::Value::Float(n) => n.to_string(),
-        duckdb::types::Value::Double(n) => n.to_string(),
-        duckdb::types::Value::Text(s) => s.clone(),
-        _ => format!("{v:?}"),
-    }
 }

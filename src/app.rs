@@ -1,11 +1,11 @@
 use crate::bridge;
+use crate::db::Db;
 use crate::query_window::QueryWindow;
 use crate::table_view::TableWindow;
-use duckdb::Connection;
 use eframe::egui;
 
 pub struct DuiApp {
-    conn: Connection,
+    db: Box<dyn Db>,
     tables: Vec<TableWindow>,
     next_table_id: usize,
     query_windows: Vec<QueryWindow>,
@@ -18,8 +18,14 @@ impl DuiApp {
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         cc.egui_ctx.set_fonts(fonts);
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let db: Box<dyn Db> = Box::new(crate::db::NativeDb::new());
+
+        #[cfg(target_arch = "wasm32")]
+        let db: Box<dyn Db> = Box::new(crate::db::WasmDb::new());
+
         Self {
-            conn: Connection::open_in_memory().expect("Failed to open DuckDB"),
+            db,
             tables: Vec::new(),
             next_table_id: 1,
             query_windows: Vec::new(),
@@ -32,24 +38,53 @@ impl DuiApp {
             ctx.input(|i| i.raw.dropped_files.clone());
 
         for file in dropped_files {
-            let path = if let Some(path) = &file.path {
-                match path.to_str() {
-                    Some(p) => p.to_string(),
-                    None => {
-                        self.error = Some("Invalid file path".to_string());
-                        continue;
+            // On native, we have a file path. On WASM, we have bytes.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let path = if let Some(path) = &file.path {
+                    match path.to_str() {
+                        Some(p) => p.to_string(),
+                        None => {
+                            self.error = Some("Invalid file path".to_string());
+                            continue;
+                        }
+                    }
+                } else {
+                    continue;
+                };
+
+                match bridge::load_file(self.db.as_ref(), &path) {
+                    Ok((name, data)) => {
+                        self.tables.push(TableWindow::new(name, data));
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
                     }
                 }
-            } else {
-                continue;
-            };
+            }
 
-            match bridge::load_file(&self.conn, &path) {
-                Ok((name, data)) => {
-                    self.tables.push(TableWindow::new(name, data));
-                }
-                Err(e) => {
-                    self.error = Some(e);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let bytes = if let Some(bytes) = &file.bytes {
+                    bytes.clone()
+                } else {
+                    continue;
+                };
+                let csv_text = match String::from_utf8(bytes.to_vec()) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.error = Some("File is not valid UTF-8".to_string());
+                        continue;
+                    }
+                };
+                let name_hint = file.name.strip_suffix(".csv").unwrap_or(&file.name);
+                match bridge::load_csv_bytes(self.db.as_ref(), name_hint, &csv_text) {
+                    Ok((name, data)) => {
+                        self.tables.push(TableWindow::new(name, data));
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                    }
                 }
             }
         }
@@ -62,13 +97,13 @@ impl eframe::App for DuiApp {
 
         // Render all table windows (keep closed ones for the side panel)
         for tw in &mut self.tables {
-            tw.show(ctx, &self.conn);
+            tw.show(ctx, self.db.as_ref());
         }
 
         // Render all query windows
         let mut any_query_ran = false;
         for qw in &mut self.query_windows {
-            let ran = qw.show(ctx, &self.conn);
+            let ran = qw.show(ctx, self.db.as_ref());
             if ran {
                 any_query_ran = true;
             }
@@ -77,7 +112,7 @@ impl eframe::App for DuiApp {
         // Refresh table data after a query modifies the database
         if any_query_ran {
             for tw in &mut self.tables {
-                tw.refresh(&self.conn);
+                tw.refresh(self.db.as_ref());
             }
         }
 
@@ -93,7 +128,7 @@ impl eframe::App for DuiApp {
                         let id = self.next_table_id;
                         self.next_table_id += 1;
                         let name = format!("table_{id}");
-                        match bridge::create_empty_table(&self.conn, &name) {
+                        match bridge::create_empty_table(self.db.as_ref(), &name) {
                             Ok(data) => self.tables.push(TableWindow::new(name, data)),
                             Err(e) => self.error = Some(e),
                         }
@@ -129,13 +164,13 @@ impl eframe::App for DuiApp {
                     }
                 }
                 if let Some(idx) = finish_rename_idx {
-                    if let Err(e) = self.tables[idx].finish_rename(&self.conn) {
+                    if let Err(e) = self.tables[idx].finish_rename(self.db.as_ref()) {
                         self.error = Some(e);
                     }
                 }
                 if let Some(idx) = remove_table_idx {
                     let name = &self.tables[idx].name;
-                    if let Err(e) = bridge::drop_table(&self.conn, name) {
+                    if let Err(e) = bridge::drop_table(self.db.as_ref(), name) {
                         self.error = Some(e);
                     }
                     self.tables.remove(idx);

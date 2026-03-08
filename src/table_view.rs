@@ -1,5 +1,5 @@
-use crate::bridge::TableData;
-use duckdb::Connection;
+use crate::bridge::{self, TableData};
+use crate::db::Db;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -16,7 +16,7 @@ enum TableAction {
 pub struct TableWindow {
     id: usize,
     pub name: String,
-    /// Stored when renaming starts so we can ALTER TABLE from old → new
+    /// Stored when renaming starts so we can ALTER TABLE from old -> new
     pub rename_old: Option<String>,
     pub data: TableData,
     pub open: bool,
@@ -43,60 +43,28 @@ impl TableWindow {
         }
     }
 
-    /// Start renaming — saves old name for the ALTER TABLE.
+    /// Start renaming -- saves old name for the ALTER TABLE.
     pub fn start_rename(&mut self) {
         self.rename_old = Some(self.name.clone());
         self.renaming = true;
     }
 
-    /// Finish renaming — issues ALTER TABLE if name changed.
-    pub fn finish_rename(&mut self, conn: &Connection) -> Result<(), String> {
+    /// Finish renaming -- issues ALTER TABLE if name changed.
+    pub fn finish_rename(&mut self, db: &dyn Db) -> Result<(), String> {
         self.renaming = false;
         if let Some(old) = self.rename_old.take() {
             if old != self.name {
                 let sql = format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", old, self.name);
-                conn.execute_batch(&sql)
+                db.execute(&sql)
                     .map_err(|e| format!("Rename failed: {e}"))?;
             }
         }
         Ok(())
     }
 
-    pub fn refresh(&mut self, conn: &Connection) {
-        let sql = format!("SELECT rowid, * FROM \"{}\" LIMIT 10000", self.name);
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            if let Ok(mut result) = stmt.query([]) {
-                // column_count includes rowid, so actual data columns = count - 1
-                let total_cols = result.as_ref().unwrap().column_count();
-                let col_count = total_cols - 1;
-                let columns: Vec<String> = (0..col_count)
-                    .map(|i| {
-                        result
-                            .as_ref()
-                            .unwrap()
-                            .column_name(i + 1)
-                            .map_or("?".to_string(), |v| v.to_string())
-                    })
-                    .collect();
-
-                let mut rows = Vec::new();
-                let mut row_ids = Vec::new();
-                while let Ok(Some(row)) = result.next() {
-                    let rid: i64 = row.get::<_, i64>(0).unwrap_or(0);
-                    row_ids.push(rid);
-                    let mut vals = Vec::with_capacity(col_count);
-                    for i in 0..col_count {
-                        let val: String = row
-                            .get::<_, duckdb::types::Value>(i + 1)
-                            .map(|v| crate::bridge::format_value(&v))
-                            .unwrap_or_default();
-                        vals.push(val);
-                    }
-                    rows.push(vals);
-                }
-
-                self.data = TableData { columns, rows, row_ids };
-            }
+    pub fn refresh(&mut self, db: &dyn Db) {
+        if let Ok(data) = bridge::read_table(db, &self.name) {
+            self.data = data;
         }
     }
 
@@ -126,7 +94,7 @@ impl TableWindow {
     }
 
     /// Render this table as a floating egui::Window. Returns false if closed.
-    pub fn show(&mut self, ctx: &egui::Context, conn: &Connection) -> bool {
+    pub fn show(&mut self, ctx: &egui::Context, db: &dyn Db) -> bool {
         let mut open = self.open;
         let width = self.estimate_width(ctx);
 
@@ -287,17 +255,16 @@ impl TableWindow {
         self.editing_cell = new_editing;
         self.editing_col = new_editing_col;
 
-        // Apply cell edits to DuckDB
+        // Apply cell edits
         for (ri, ci, new_val) in edits {
             if let Some(&rid) = self.data.row_ids.get(ri) {
                 let col = &self.data.columns[ci];
+                let escaped = new_val.replace('\'', "''");
                 let sql = format!(
-                    "UPDATE \"{}\" SET \"{}\" = $1 WHERE rowid = $2",
-                    self.name, col
+                    "UPDATE \"{}\" SET \"{}\" = '{}' WHERE rowid = {}",
+                    self.name, col, escaped, rid
                 );
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let _ = stmt.execute(duckdb::params![new_val, rid]);
-                }
+                let _ = db.execute(&sql);
             }
         }
 
@@ -310,8 +277,8 @@ impl TableWindow {
                         "ALTER TABLE \"{}\" ADD COLUMN \"{}\" VARCHAR",
                         self.name, new_col
                     );
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    let _ = db.execute(&sql);
+                    self.refresh(db);
                 }
                 TableAction::DropColumn(ci) => {
                     if let Some(col) = self.data.columns.get(ci) {
@@ -319,8 +286,8 @@ impl TableWindow {
                             "ALTER TABLE \"{}\" DROP COLUMN \"{}\"",
                             self.name, col
                         );
-                        let _ = conn.execute_batch(&sql);
-                        self.refresh(conn);
+                        let _ = db.execute(&sql);
+                        self.refresh(db);
                     }
                 }
                 TableAction::RenameColumn(_ci, old, new) => {
@@ -328,21 +295,21 @@ impl TableWindow {
                         "ALTER TABLE \"{}\" RENAME COLUMN \"{}\" TO \"{}\"",
                         self.name, old, new
                     );
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    let _ = db.execute(&sql);
+                    self.refresh(db);
                 }
                 TableAction::AddRow => {
                     let sql = format!("INSERT INTO \"{}\" DEFAULT VALUES", self.name);
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    let _ = db.execute(&sql);
+                    self.refresh(db);
                 }
                 TableAction::DeleteRow(rid) => {
                     let sql = format!(
                         "DELETE FROM \"{}\" WHERE rowid = {}",
                         self.name, rid
                     );
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    let _ = db.execute(&sql);
+                    self.refresh(db);
                 }
             }
         }

@@ -166,6 +166,7 @@ impl TableWindow {
                 for _ in &self.data.columns {
                     table = table.column(Column::auto().at_least(40.0).resizable(true));
                 }
+                table = table.column(Column::auto().resizable(false));
 
                 table
                     .header(20.0, |mut header| {
@@ -210,13 +211,22 @@ impl TableWindow {
                                 }
                             });
                         }
+                        header.col(|ui| {
+                            if ui.small_button(egui_phosphor::regular::PLUS).clicked() {
+                                actions.push(TableAction::AddColumn);
+                            }
+                        });
                     })
                     .body(|body| {
                         body.rows(text_height, row_count, |mut row| {
                             let ri = row.index();
                             let col_count = self.data.columns.len();
+                            let mut row_hovered = false;
                             for ci in 0..col_count {
                                 row.col(|ui| {
+                                    if ui.rect_contains_pointer(ui.max_rect()) {
+                                        row_hovered = true;
+                                    }
                                     if editing == Some((ri, ci)) {
                                         let cell = &mut self.data.rows[ri][ci];
                                         let resp = ui.text_edit_singleline(cell);
@@ -251,16 +261,22 @@ impl TableWindow {
                                     }
                                 });
                             }
+                            row.col(|ui| {
+                                if ui.rect_contains_pointer(ui.max_rect()) {
+                                    row_hovered = true;
+                                }
+                                if let Some(&rid) = self.data.row_ids.get(ri) {
+                                    let x_resp = ui.add_visible(row_hovered, egui::Button::new(egui_phosphor::regular::X).small());
+                                    if x_resp.clicked() {
+                                        actions.push(TableAction::DeleteRow(rid));
+                                    }
+                                }
+                            });
                         });
                     });
-                ui.horizontal(|ui| {
-                    if ui.small_button(format!("{} row", egui_phosphor::regular::PLUS)).clicked() {
-                        actions.push(TableAction::AddRow);
-                    }
-                    if ui.small_button(format!("{} col", egui_phosphor::regular::PLUS)).clicked() {
-                        actions.push(TableAction::AddColumn);
-                    }
-                });
+                if ui.small_button(format!("{} row", egui_phosphor::regular::PLUS)).clicked() {
+                    actions.push(TableAction::AddRow);
+                }
             });
 
         self.editing_cell = new_editing;

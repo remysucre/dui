@@ -5,29 +5,40 @@ use egui_extras::{Column, TableBuilder};
 
 pub struct QueryWindow {
     id: usize,
+    pub name: String,
+    pub renaming: bool,
     query: String,
     result: Option<Result<TableData, String>>,
-    open: bool,
+    pub open: bool,
 }
 
 impl QueryWindow {
     pub fn new(id: usize) -> Self {
         Self {
             id,
+            name: format!("Query {id}"),
+            renaming: false,
             query: String::new(),
             result: None,
             open: true,
         }
     }
 
-    /// Render the query window. Returns (still_open, query_was_run).
-    pub fn show(&mut self, ctx: &egui::Context, conn: &Connection) -> (bool, bool) {
+    /// Render the query window. Returns whether a query was run.
+    pub fn show(&mut self, ctx: &egui::Context, conn: &Connection) -> bool {
+        if !self.open {
+            return false;
+        }
         let mut open = self.open;
         let ran = std::cell::Cell::new(false);
-        egui::Window::new(format!("Query {}", self.id))
+        let window_frame = egui::Frame::window(&ctx.style())
+            .inner_margin(egui::Margin::same(2));
+        egui::Window::new(&self.name)
+            .id(egui::Id::new(("query_window", self.id)))
             .open(&mut open)
-            .default_size([600.0, 400.0])
+            .default_size([300.0, 400.0])
             .resizable(true)
+            .frame(window_frame)
             .show(ctx, |ui| {
                 ui.label("SQL:");
                 let layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
@@ -68,7 +79,7 @@ impl QueryWindow {
                 }
             });
         self.open = open;
-        (open, ran.get())
+        ran.get()
     }
 }
 
@@ -102,7 +113,7 @@ fn run_query(conn: &Connection, sql: &str) -> Result<TableData, String> {
         rows.push(vals);
     }
 
-    Ok(TableData { columns, rows })
+    Ok(TableData { columns, rows, row_ids: Vec::new() })
 }
 
 fn format_value(v: &duckdb::types::Value) -> String {

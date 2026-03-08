@@ -5,6 +5,7 @@ use duckdb::Connection;
 pub struct TableData {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
+    pub row_ids: Vec<i64>,
 }
 
 /// Load a file into DuckDB and return the table name and parsed data.
@@ -60,31 +61,56 @@ pub fn load_file(conn: &Connection, path: &str) -> Result<(String, TableData), S
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // Read rows (up to 10 000)
+    // Read rows (up to 10 000) with rowid
     let col_count = columns.len();
-    let rows: Vec<Vec<String>> = {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut row_ids: Vec<i64> = Vec::new();
+    {
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT * FROM \"{table_name}\" LIMIT 10000"
+                "SELECT rowid, * FROM \"{table_name}\" LIMIT 10000"
             ))
             .map_err(|e| format!("Failed to query rows: {e}"))?;
         let mapped = stmt
             .query_map([], |row| {
+                let rid: i64 = row.get(0)?;
                 let mut vals = Vec::with_capacity(col_count);
                 for i in 0..col_count {
                     let val: String = row
-                        .get::<_, duckdb::types::Value>(i)
+                        .get::<_, duckdb::types::Value>(i + 1)
                         .map(|v| format_value(&v))
                         .unwrap_or_default();
                     vals.push(val);
                 }
-                Ok(vals)
+                Ok((rid, vals))
             })
             .map_err(|e| format!("Failed to read rows: {e}"))?;
-        mapped.filter_map(|r| r.ok()).collect()
-    };
+        for r in mapped.flatten() {
+            row_ids.push(r.0);
+            rows.push(r.1);
+        }
+    }
 
-    Ok((table_name, TableData { columns, rows }))
+    Ok((table_name, TableData { columns, rows, row_ids }))
+}
+
+/// Create an empty table with a single column.
+pub fn create_empty_table(conn: &Connection, name: &str) -> Result<TableData, String> {
+    conn.execute_batch(&format!(
+        "CREATE TABLE \"{name}\" (value VARCHAR)"
+    ))
+    .map_err(|e| format!("Failed to create table: {e}"))?;
+    Ok(TableData {
+        columns: vec!["value".to_string()],
+        rows: Vec::new(),
+        row_ids: Vec::new(),
+    })
+}
+
+/// Drop a table from DuckDB.
+pub fn drop_table(conn: &Connection, name: &str) -> Result<(), String> {
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS \"{name}\""))
+        .map_err(|e| format!("Failed to drop table: {e}"))
 }
 
 pub fn format_value(v: &duckdb::types::Value) -> String {

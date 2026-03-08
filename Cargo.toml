@@ -7,5 +7,6 @@ edition = "2021"
 eframe = "0.31"
 egui_extras = "0.31"
 duckdb = { version = "1", features = ["bundled"] }
+egui-phosphor = { version = "0.9", features = ["regular"] }
 log = "0.4"
 env_logger = "0.11"

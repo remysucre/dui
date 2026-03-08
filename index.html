@@ -31,11 +31,24 @@
         // Stubs — available immediately so Rust can call them before duckdb-wasm loads
         window._ddb_conn = null;
         window._ddb_init_error = null;
+        window._ddb_pending_drops = {};
         window._ddb_is_ready = function() { return window._ddb_conn ? "true" : "false"; };
         window._ddb_get_init_error = function() { return window._ddb_init_error || ""; };
         window._ddb_exec_async = async function() { return "ERROR: duckdb not initialized"; };
         window._ddb_query_async = async function() { return "ERROR: duckdb not initialized"; };
         window._ddb_batch_async = async function() { return "ERROR: duckdb not initialized"; };
+        window._ddb_load_dropped_file = async function() { return "ERROR: not initialized"; };
+
+        // Capture File objects from drop events before egui processes them
+        document.addEventListener("drop", function(e) {
+            var files = e.dataTransfer && e.dataTransfer.files;
+            if (files) {
+                for (var i = 0; i < files.length; i++) {
+                    window._ddb_pending_drops[files[i].name] = files[i];
+                }
+            }
+            // Don't preventDefault — let egui also see the event
+        }, true);  // useCapture=true to fire before egui's handler
 
         // Init duckdb-wasm asynchronously.
         // DDL/DML uses db.runQuery() (atomic, no result parsing).
@@ -99,6 +112,24 @@
                 };
 
                 // --- replace stubs ---
+
+                // Load a dropped file via registerFileHandle (zero-copy)
+                window._ddb_load_dropped_file = async function(jsonInput) {
+                    try {
+                        var input = JSON.parse(jsonInput);
+                        var file = window._ddb_pending_drops[input.filename];
+                        if (!file) return "ERROR: file not found in pending drops";
+                        delete window._ddb_pending_drops[input.filename];
+
+                        await db.registerFileHandle(input.filename, file, 2, true);
+                        await db.runQuery(connId, 'CREATE TABLE "' + input.name + '" AS SELECT * FROM read_csv_auto(\'' + input.filename + '\')');
+                        var result = await conn.query('SELECT rowid, * FROM "' + input.name + '" LIMIT 10000');
+                        await db.dropFile(input.filename);
+                        return JSON.stringify(arrowToJson(result));
+                    } catch (e) {
+                        return "ERROR: " + (e.message || String(e));
+                    }
+                };
 
                 // DDL/DML: use db.runQuery (atomic, no result parsing needed)
                 window._ddb_exec_async = async function(sql) {

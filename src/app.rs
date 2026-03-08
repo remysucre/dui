@@ -10,8 +10,8 @@ pub struct DuiApp {
     next_table_id: usize,
     query_windows: Vec<QueryWindow>,
     error: Option<String>,
-    /// Pending CSV loads waiting for async batch results (WASM)
-    pending_loads: Vec<bridge::CsvLoadPlan>,
+    /// Pending file loads waiting for async results (WASM): (table_name, filename)
+    pending_loads: Vec<(String, String)>,
 }
 
 impl DuiApp {
@@ -71,34 +71,25 @@ impl DuiApp {
 
             #[cfg(target_arch = "wasm32")]
             {
-                let bytes = if let Some(bytes) = &file.bytes {
-                    bytes.clone()
-                } else {
-                    continue;
-                };
-                let csv_text = match String::from_utf8(bytes.to_vec()) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        self.error = Some("File is not valid UTF-8".to_string());
-                        continue;
+                let filename = file.name.clone();
+                let name_hint = std::path::Path::new(&filename)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("table");
+                let table_name: String = name_hint
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                let table_name = if table_name.is_empty() { "table".to_string() } else { table_name };
+
+                match self.db.load_dropped_file(&table_name, &filename) {
+                    Ok(result) if !result.columns.is_empty() => {
+                        let data = bridge::parse_rowid_result(result);
+                        self.tables.push(TableWindow::new(table_name, data));
                     }
-                };
-                let name_hint = file.name.strip_suffix(".csv").unwrap_or(&file.name);
-                match bridge::prepare_csv_load(name_hint, &csv_text) {
-                    Ok(plan) => {
-                        match self.db.batch(&plan.stmts, Some(&plan.final_query)) {
-                            Ok(result) if !result.columns.is_empty() => {
-                                let data = bridge::parse_rowid_result(result);
-                                self.tables.push(TableWindow::new(plan.name, data));
-                            }
-                            Ok(_) => {
-                                // WASM: result pending, poll next frame
-                                self.pending_loads.push(plan);
-                            }
-                            Err(e) => {
-                                self.error = Some(e);
-                            }
-                        }
+                    Ok(_) => {
+                        // WASM: result pending, poll next frame
+                        self.pending_loads.push((table_name, filename));
                     }
                     Err(e) => {
                         self.error = Some(e);
@@ -113,13 +104,13 @@ impl eframe::App for DuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
 
-        // Poll pending CSV loads (WASM async)
+        // Poll pending file loads (WASM async)
         let mut completed_loads = Vec::new();
-        for (idx, plan) in self.pending_loads.iter().enumerate() {
-            match self.db.batch(&plan.stmts, Some(&plan.final_query)) {
+        for (idx, (table_name, filename)) in self.pending_loads.iter().enumerate() {
+            match self.db.load_dropped_file(table_name, filename) {
                 Ok(result) if !result.columns.is_empty() => {
                     let data = bridge::parse_rowid_result(result);
-                    self.tables.push(TableWindow::new(plan.name.clone(), data));
+                    self.tables.push(TableWindow::new(table_name.clone(), data));
                     completed_loads.push(idx);
                 }
                 Ok(_) => { ctx.request_repaint(); }

@@ -30,6 +30,11 @@ pub trait Db {
         None
     }
 
+    /// Load a dropped file by filename (WASM only — uses registerFileHandle).
+    fn load_dropped_file(&self, _table_name: &str, _filename: &str) -> Result<QueryResult, String> {
+        Err("not supported".to_string())
+    }
+
     /// Run a batch of statements, then optionally run a final query.
     /// Returns the query result (or empty if no final query).
     /// On native this just runs them sequentially. On WASM this sends
@@ -265,6 +270,38 @@ mod wasm {
             let slot: ResultSlot = Rc::new(RefCell::new(None));
             cache.insert(sql.to_string(), slot.clone());
             spawn_js_call("_ddb_query_async", sql.to_string(), slot);
+            Ok(QueryResult::default())
+        }
+
+        fn load_dropped_file(&self, table_name: &str, filename: &str) -> Result<QueryResult, String> {
+            if !self.is_ready() {
+                return Err("Database is loading...".to_string());
+            }
+
+            let input = serde_json::json!({
+                "name": table_name,
+                "filename": filename,
+            });
+            let key = format!("__file_load__{table_name}");
+
+            let mut cache = self.query_cache.borrow_mut();
+
+            if let Some(slot) = cache.get(&key) {
+                let result = slot.borrow_mut().take();
+                if let Some(res) = result {
+                    cache.remove(&key);
+                    return match res {
+                        Ok(json) => serde_json::from_str(&json)
+                            .map_err(|e| format!("JSON parse error: {e}")),
+                        Err(e) => Err(e),
+                    };
+                }
+                return Ok(QueryResult::default());
+            }
+
+            let slot: ResultSlot = Rc::new(RefCell::new(None));
+            cache.insert(key, slot.clone());
+            spawn_js_call("_ddb_load_dropped_file", input.to_string(), slot);
             Ok(QueryResult::default())
         }
 

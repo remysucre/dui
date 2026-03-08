@@ -34,57 +34,6 @@ pub fn load_file(db: &dyn Db, path: &str) -> Result<(String, TableData), String>
     read_table(db, &table_name).map(|data| (table_name, data))
 }
 
-/// Plan for loading CSV data, built without executing any SQL.
-pub struct CsvLoadPlan {
-    pub name: String,
-    pub stmts: Vec<String>,
-    pub final_query: String,
-}
-
-/// Build SQL statements for loading CSV data without executing them.
-pub fn prepare_csv_load(name_hint: &str, csv: &str) -> Result<CsvLoadPlan, String> {
-    let safe_name: String = name_hint
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
-        .collect();
-    let safe_name = if safe_name.is_empty() { "table".to_string() } else { safe_name };
-
-    let mut lines = csv.lines();
-    let header = lines.next().ok_or("CSV is empty")?;
-    let columns: Vec<&str> = header.split(',').map(|s| s.trim()).collect();
-
-    let mut stmts = Vec::new();
-
-    let col_defs: Vec<String> = columns.iter().map(|c| format!("\"{}\" VARCHAR", c)).collect();
-    stmts.push(format!(
-        "CREATE TABLE \"{}\" ({})",
-        safe_name,
-        col_defs.join(", ")
-    ));
-
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let vals: Vec<String> = line
-            .split(',')
-            .map(|s| {
-                let s = s.trim();
-                format!("'{}'", s.replace('\'', "''"))
-            })
-            .collect();
-        stmts.push(format!(
-            "INSERT INTO \"{}\" VALUES ({})",
-            safe_name,
-            vals.join(", ")
-        ));
-    }
-
-    let final_query = format!("SELECT rowid, * FROM \"{}\" LIMIT 10000", safe_name);
-
-    Ok(CsvLoadPlan { name: safe_name, stmts, final_query })
-}
-
 /// Parse a query result that includes rowid as the first column.
 pub fn parse_rowid_result(result: QueryResult) -> TableData {
     if result.columns.is_empty() {

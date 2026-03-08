@@ -1,3 +1,5 @@
 /target
 /dist
 *.csv
+**/tests/snapshots/**/*.diff.png
+**/tests/snapshots/**/*.new.png

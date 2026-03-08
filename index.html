@@ -38,10 +38,9 @@
         window._ddb_batch_async = async function() { return "ERROR: duckdb not initialized"; };
 
         // Init duckdb-wasm asynchronously.
-        // Uses db.runQuery() (the low-level atomic API) instead of conn.query().
-        // conn.query() internally calls conn.send() (streaming) then new arrow.Table(),
-        // which crashes on Safari. runQuery() returns raw Arrow IPC bytes — no streaming
-        // state, no dirty connections. This is the same API the duckdb-wasm shell uses.
+        // DDL/DML uses db.runQuery() (atomic, no result parsing).
+        // SELECT uses conn.query() (parses results with bundled apache-arrow).
+        // Worker is created via blob URL for cross-origin CDN compatibility.
         (async function() {
             try {
                 var el = document.getElementById("loading");
@@ -80,7 +79,7 @@
 
                 // Extract connection ID for low-level runQuery calls
                 var connId = conn._conn;
-                console.log("duckdb-wasm ready, connId:", connId);
+                console.log("duckdb-wasm ready");
 
                 // --- helpers ---
 

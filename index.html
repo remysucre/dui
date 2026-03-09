@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dui</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #1a1a1a;
+        }
+        canvas {
+            width: 100% !important;
+            height: 100% !important;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ccc;
+            font-family: sans-serif;
+            font-size: 1.2em;
+        }
+    </style>
+    <script>
+        // Stubs — available immediately so Rust can call them before duckdb-wasm loads
+        window._ddb_conn = null;
+        window._ddb_init_error = null;
+        window._ddb_pending_drops = {};
+        window._ddb_is_ready = function() { return window._ddb_conn ? "true" : "false"; };
+        window._ddb_get_init_error = function() { return window._ddb_init_error || ""; };
+        window._ddb_exec_async = async function() { return "ERROR: duckdb not initialized"; };
+        window._ddb_query_async = async function() { return "ERROR: duckdb not initialized"; };
+        window._ddb_batch_async = async function() { return "ERROR: duckdb not initialized"; };
+        window._ddb_load_dropped_file = async function() { return "ERROR: not initialized"; };
+
+        // Capture File objects from drop events before egui processes them
+        document.addEventListener("drop", function(e) {
+            var files = e.dataTransfer && e.dataTransfer.files;
+            if (files) {
+                for (var i = 0; i < files.length; i++) {
+                    window._ddb_pending_drops[files[i].name] = files[i];
+                }
+            }
+            // Don't preventDefault — let egui also see the event
+        }, true);  // useCapture=true to fire before egui's handler
+
+        // Init duckdb-wasm asynchronously.
+        // DDL/DML uses db.runQuery() (atomic, no result parsing).
+        // SELECT uses conn.query() (parses results with bundled apache-arrow).
+        // Worker is created via blob URL for cross-origin CDN compatibility.
+        (async function() {
+            try {
+                var el = document.getElementById("loading");
+                if (el) el.textContent = "Loading DuckDB...";
+
+                var duckdb = await import("https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm");
+
+                if (el) el.textContent = "Selecting bundle...";
+                var bundles = await duckdb.selectBundle({
+                    mvp: {
+                        mainModule: "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-mvp.wasm",
+                        mainWorker: "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-mvp.worker.js",
+                    },
+                    eh: {
+                        mainModule: "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-eh.wasm",
+                        mainWorker: "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/dist/duckdb-browser-eh.worker.js",
+                    },
+                });
+
+                if (el) el.textContent = "Creating worker...";
+                // Worker must be created separately and passed to AsyncDuckDB.
+                // Use blob URL to handle cross-origin CDN scripts.
+                var workerResp = await fetch(bundles.mainWorker);
+                var workerBlob = new Blob([await workerResp.text()], { type: "application/javascript" });
+                var workerUrl = URL.createObjectURL(workerBlob);
+                var worker = new Worker(workerUrl);
+
+                if (el) el.textContent = "Instantiating DuckDB...";
+                var logger = new duckdb.ConsoleLogger();
+                var db = new duckdb.AsyncDuckDB(logger, worker);
+                await db.instantiate(bundles.mainModule);
+
+                if (el) el.textContent = "Connecting...";
+                var conn = await db.connect();
+                window._ddb_conn = conn;
+
+                // Extract connection ID for low-level runQuery calls
+                var connId = conn._conn;
+                console.log("duckdb-wasm ready");
+
+                // --- helpers ---
+
+                // Convert arrow.Table (from conn.query) to our JSON format
+                var arrowToJson = function(table) {
+                    var columns = table.schema.fields.map(function(f) { return f.name; });
+                    var rows = [];
+                    for (var r = 0; r < table.numRows; r++) {
+                        var row = [];
+                        for (var c = 0; c < columns.length; c++) {
+                            var val = table.getChildAt(c).get(r);
+                            row.push(val == null ? "" : String(val));
+                        }
+                        rows.push(row);
+                    }
+                    return { columns: columns, rows: rows, row_ids: [] };
+                };
+
+                // --- replace stubs ---
+
+                // Load a dropped file via registerFileHandle (zero-copy)
+                window._ddb_load_dropped_file = async function(jsonInput) {
+                    try {
+                        var input = JSON.parse(jsonInput);
+                        var file = window._ddb_pending_drops[input.filename];
+                        if (!file) return "ERROR: file not found in pending drops";
+                        delete window._ddb_pending_drops[input.filename];
+
+                        await db.registerFileHandle(input.filename, file, 2, true);
+                        var ext = input.filename.split('.').pop().toLowerCase();
+                        var reader = ext === 'parquet' ? 'read_parquet' : ext === 'json' || ext === 'jsonl' || ext === 'ndjson' ? 'read_json_auto' : 'read_csv_auto';
+                        await db.runQuery(connId, 'CREATE TABLE "' + input.name + '" AS SELECT * FROM ' + reader + '(\'' + input.filename + '\')');
+                        var result = await conn.query('SELECT rowid, * FROM "' + input.name + '" LIMIT 10000');
+                        await db.dropFile(input.filename);
+                        return JSON.stringify(arrowToJson(result));
+                    } catch (e) {
+                        return "ERROR: " + (e.message || String(e));
+                    }
+                };
+
+                // DDL/DML: use db.runQuery (atomic, no result parsing needed)
+                window._ddb_exec_async = async function(sql) {
+                    try {
+                        await db.runQuery(connId, sql);
+                        return "OK";
+                    } catch (e) {
+                        return "ERROR: " + (e.message || String(e));
+                    }
+                };
+
+                // SELECT: use conn.query (uses bundled apache-arrow for parsing)
+                window._ddb_query_async = async function(sql) {
+                    try {
+                        var result = await conn.query(sql);
+                        return JSON.stringify(arrowToJson(result));
+                    } catch (e) {
+                        return "ERROR: " + (e.message || String(e));
+                    }
+                };
+
+                // Batch: runQuery for DDL/DML stmts, conn.query for final SELECT
+                window._ddb_batch_async = async function(jsonInput) {
+                    try {
+                        var input = JSON.parse(jsonInput);
+                        for (var i = 0; i < input.stmts.length; i++) {
+                            await db.runQuery(connId, input.stmts[i]);
+                        }
+                        if (input.query) {
+                            var result = await conn.query(input.query);
+                            return JSON.stringify(arrowToJson(result));
+                        }
+                        return "OK";
+                    } catch (e) {
+                        return "ERROR: " + (e.message || String(e));
+                    }
+                };
+
+            } catch (e) {
+                console.error("duckdb-wasm init failed:", e);
+                window._ddb_init_error = e.message || String(e);
+            }
+        })();
+    </script>
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <link data-trunk rel="copy-dir" href="assets" />
+</head>
+<body>
+    <div id="loading">Loading dui...</div>
+    <canvas id="the_canvas_id"></canvas>
+</body>
+</html>

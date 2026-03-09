@@ -1,5 +1,5 @@
 use crate::bridge::TableData;
-use duckdb::Connection;
+use crate::db::Db;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -10,6 +10,8 @@ pub struct QueryWindow {
     query: String,
     result: Option<Result<TableData, String>>,
     pub open: bool,
+    /// Pending async query being polled
+    pending_query: Option<String>,
 }
 
 impl QueryWindow {
@@ -21,16 +23,35 @@ impl QueryWindow {
             query: String::new(),
             result: None,
             open: true,
+            pending_query: None,
         }
     }
 
     /// Render the query window. Returns whether a query was run.
-    pub fn show(&mut self, ctx: &egui::Context, conn: &Connection) -> bool {
+    pub fn show(&mut self, ctx: &egui::Context, db: &dyn Db) -> bool {
         if !self.open {
             return false;
         }
+
+        // Poll pending async query
+        let mut ran_from_poll = false;
+        if let Some(sql) = self.pending_query.clone() {
+            match db.query(&sql) {
+                Ok(result) if !result.columns.is_empty() => {
+                    self.result = Some(Ok(result.into_table_data()));
+                    self.pending_query = None;
+                    ran_from_poll = true;
+                }
+                Ok(_) => { ctx.request_repaint(); }
+                Err(e) => {
+                    self.result = Some(Err(e));
+                    self.pending_query = None;
+                }
+            }
+        }
+
         let mut open = self.open;
-        let ran = std::cell::Cell::new(false);
+        let ran = std::cell::Cell::new(ran_from_poll);
         let window_frame = egui::Frame::window(&ctx.style())
             .inner_margin(egui::Margin::same(2));
         egui::Window::new(&self.name)
@@ -54,8 +75,20 @@ impl QueryWindow {
                 );
 
                 if ui.button("Run").clicked() {
-                    self.result = Some(run_query(conn, &self.query));
-                    ran.set(true);
+                    match run_query(db, &self.query) {
+                        Ok(data) if !data.columns.is_empty() => {
+                            self.result = Some(Ok(data));
+                            ran.set(true);
+                        }
+                        Ok(_) => {
+                            // WASM: result pending, poll next frame
+                            self.pending_query = Some(self.query.clone());
+                            self.result = None;
+                        }
+                        Err(e) => {
+                            self.result = Some(Err(e));
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -83,57 +116,9 @@ impl QueryWindow {
     }
 }
 
-fn run_query(conn: &Connection, sql: &str) -> Result<TableData, String> {
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let mut result = stmt.query([]).map_err(|e| e.to_string())?;
-
-    // Column info is available on Rows after execution
-    let col_count = result.as_ref().unwrap().column_count();
-    let columns: Vec<String> = (0..col_count)
-        .map(|i| {
-            result
-                .as_ref()
-                .unwrap()
-                .column_name(i)
-                .map_or("?", |v| v)
-                .to_string()
-        })
-        .collect();
-
-    let mut rows = Vec::new();
-    while let Some(row) = result.next().map_err(|e| e.to_string())? {
-        let mut vals = Vec::with_capacity(col_count);
-        for i in 0..col_count {
-            let val: String = row
-                .get::<_, duckdb::types::Value>(i)
-                .map(|v| format_value(&v))
-                .unwrap_or_default();
-            vals.push(val);
-        }
-        rows.push(vals);
-    }
-
-    Ok(TableData { columns, rows, row_ids: Vec::new() })
-}
-
-fn format_value(v: &duckdb::types::Value) -> String {
-    match v {
-        duckdb::types::Value::Null => String::new(),
-        duckdb::types::Value::Boolean(b) => b.to_string(),
-        duckdb::types::Value::TinyInt(n) => n.to_string(),
-        duckdb::types::Value::SmallInt(n) => n.to_string(),
-        duckdb::types::Value::Int(n) => n.to_string(),
-        duckdb::types::Value::BigInt(n) => n.to_string(),
-        duckdb::types::Value::HugeInt(n) => n.to_string(),
-        duckdb::types::Value::UTinyInt(n) => n.to_string(),
-        duckdb::types::Value::USmallInt(n) => n.to_string(),
-        duckdb::types::Value::UInt(n) => n.to_string(),
-        duckdb::types::Value::UBigInt(n) => n.to_string(),
-        duckdb::types::Value::Float(n) => n.to_string(),
-        duckdb::types::Value::Double(n) => n.to_string(),
-        duckdb::types::Value::Text(s) => s.clone(),
-        _ => format!("{v:?}"),
-    }
+fn run_query(db: &dyn Db, sql: &str) -> Result<TableData, String> {
+    let result = db.query(sql)?;
+    Ok(result.into_table_data())
 }
 
 const SQL_KEYWORDS: &[&str] = &[

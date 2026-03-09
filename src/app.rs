@@ -1,15 +1,17 @@
 use crate::bridge;
+use crate::db::Db;
 use crate::query_window::QueryWindow;
 use crate::table_view::TableWindow;
-use duckdb::Connection;
 use eframe::egui;
 
 pub struct DuiApp {
-    conn: Connection,
+    db: Box<dyn Db>,
     tables: Vec<TableWindow>,
     next_table_id: usize,
     query_windows: Vec<QueryWindow>,
     error: Option<String>,
+    /// Pending file loads waiting for async results (WASM): (table_name, filename)
+    pending_loads: Vec<(String, String)>,
 }
 
 impl DuiApp {
@@ -18,38 +20,80 @@ impl DuiApp {
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         cc.egui_ctx.set_fonts(fonts);
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let db: Box<dyn Db> = Box::new(crate::db::NativeDb::new());
+
+        #[cfg(target_arch = "wasm32")]
+        let db: Box<dyn Db> = Box::new(crate::db::WasmDb::new());
+
         Self {
-            conn: Connection::open_in_memory().expect("Failed to open DuckDB"),
+            db,
             tables: Vec::new(),
             next_table_id: 1,
             query_windows: Vec::new(),
             error: None,
+            pending_loads: Vec::new(),
         }
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        if !self.db.is_ready() {
+            return;
+        }
         let dropped_files: Vec<egui::DroppedFile> =
             ctx.input(|i| i.raw.dropped_files.clone());
 
         for file in dropped_files {
-            let path = if let Some(path) = &file.path {
-                match path.to_str() {
-                    Some(p) => p.to_string(),
-                    None => {
-                        self.error = Some("Invalid file path".to_string());
-                        continue;
+            // On native, we have a file path. On WASM, we have bytes.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let path = if let Some(path) = &file.path {
+                    match path.to_str() {
+                        Some(p) => p.to_string(),
+                        None => {
+                            self.error = Some("Invalid file path".to_string());
+                            continue;
+                        }
+                    }
+                } else {
+                    continue;
+                };
+
+                match bridge::load_file(self.db.as_ref(), &path) {
+                    Ok((name, data)) => {
+                        self.tables.push(TableWindow::new(name, data));
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
                     }
                 }
-            } else {
-                continue;
-            };
+            }
 
-            match bridge::load_file(&self.conn, &path) {
-                Ok((name, data)) => {
-                    self.tables.push(TableWindow::new(name, data));
-                }
-                Err(e) => {
-                    self.error = Some(e);
+            #[cfg(target_arch = "wasm32")]
+            {
+                let filename = file.name.clone();
+                let name_hint = std::path::Path::new(&filename)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("table");
+                let table_name: String = name_hint
+                    .chars()
+                    .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                let table_name = if table_name.is_empty() { "table".to_string() } else { table_name };
+
+                match self.db.load_dropped_file(&table_name, &filename) {
+                    Ok(result) if !result.columns.is_empty() => {
+                        let data = bridge::parse_rowid_result(result);
+                        self.tables.push(TableWindow::new(table_name, data));
+                    }
+                    Ok(_) => {
+                        // WASM: result pending, poll next frame
+                        self.pending_loads.push((table_name, filename));
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                    }
                 }
             }
         }
@@ -60,15 +104,35 @@ impl eframe::App for DuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
 
+        // Poll pending file loads (WASM async)
+        let mut completed_loads = Vec::new();
+        for (idx, (table_name, filename)) in self.pending_loads.iter().enumerate() {
+            match self.db.load_dropped_file(table_name, filename) {
+                Ok(result) if !result.columns.is_empty() => {
+                    let data = bridge::parse_rowid_result(result);
+                    self.tables.push(TableWindow::new(table_name.clone(), data));
+                    completed_loads.push(idx);
+                }
+                Ok(_) => { ctx.request_repaint(); }
+                Err(e) => {
+                    self.error = Some(e);
+                    completed_loads.push(idx);
+                }
+            }
+        }
+        for idx in completed_loads.into_iter().rev() {
+            self.pending_loads.remove(idx);
+        }
+
         // Render all table windows (keep closed ones for the side panel)
         for tw in &mut self.tables {
-            tw.show(ctx, &self.conn);
+            tw.show(ctx, self.db.as_ref());
         }
 
         // Render all query windows
         let mut any_query_ran = false;
         for qw in &mut self.query_windows {
-            let ran = qw.show(ctx, &self.conn);
+            let ran = qw.show(ctx, self.db.as_ref());
             if ran {
                 any_query_ran = true;
             }
@@ -77,7 +141,7 @@ impl eframe::App for DuiApp {
         // Refresh table data after a query modifies the database
         if any_query_ran {
             for tw in &mut self.tables {
-                tw.refresh(&self.conn);
+                tw.refresh(self.db.as_ref());
             }
         }
 
@@ -93,7 +157,7 @@ impl eframe::App for DuiApp {
                         let id = self.next_table_id;
                         self.next_table_id += 1;
                         let name = format!("table_{id}");
-                        match bridge::create_empty_table(&self.conn, &name) {
+                        match bridge::create_empty_table(self.db.as_ref(), &name) {
                             Ok(data) => self.tables.push(TableWindow::new(name, data)),
                             Err(e) => self.error = Some(e),
                         }
@@ -129,13 +193,13 @@ impl eframe::App for DuiApp {
                     }
                 }
                 if let Some(idx) = finish_rename_idx {
-                    if let Err(e) = self.tables[idx].finish_rename(&self.conn) {
+                    if let Err(e) = self.tables[idx].finish_rename(self.db.as_ref()) {
                         self.error = Some(e);
                     }
                 }
                 if let Some(idx) = remove_table_idx {
                     let name = &self.tables[idx].name;
-                    if let Err(e) = bridge::drop_table(&self.conn, name) {
+                    if let Err(e) = bridge::drop_table(self.db.as_ref(), name) {
                         self.error = Some(e);
                     }
                     self.tables.remove(idx);
@@ -206,7 +270,19 @@ impl eframe::App for DuiApp {
                     ui.add_space(ui.available_height() / 3.0);
                     ui.heading("dui");
                     ui.add_space(8.0);
-                    ui.label("Drop a data file here");
+                    if !self.db.is_ready() {
+                        if let Some(err) = self.db.init_error() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 100, 100),
+                                format!("Database init failed: {err}"),
+                            );
+                        } else {
+                            ui.label("Initializing database...");
+                            ctx.request_repaint();
+                        }
+                    } else {
+                        ui.label("Drop a data file here");
+                    }
                 });
             }
         });

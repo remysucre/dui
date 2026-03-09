@@ -1,5 +1,5 @@
-use crate::bridge::TableData;
-use duckdb::Connection;
+use crate::bridge::{self, TableData};
+use crate::db::Db;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
@@ -16,7 +16,7 @@ enum TableAction {
 pub struct TableWindow {
     id: usize,
     pub name: String,
-    /// Stored when renaming starts so we can ALTER TABLE from old → new
+    /// Stored when renaming starts so we can ALTER TABLE from old -> new
     pub rename_old: Option<String>,
     pub data: TableData,
     pub open: bool,
@@ -25,6 +25,8 @@ pub struct TableWindow {
     editing_cell: Option<(usize, usize)>,
     /// Column being renamed: (col_index, old_name)
     editing_col: Option<(usize, String)>,
+    /// Pending async batch operation: (stmts, final_query)
+    pending_batch: Option<(Vec<String>, String)>,
 }
 
 static NEXT_TABLE_WINDOW_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -40,63 +42,42 @@ impl TableWindow {
             renaming: false,
             editing_cell: None,
             editing_col: None,
+            pending_batch: None,
         }
     }
 
-    /// Start renaming — saves old name for the ALTER TABLE.
+    /// Start renaming -- saves old name for the ALTER TABLE.
     pub fn start_rename(&mut self) {
         self.rename_old = Some(self.name.clone());
         self.renaming = true;
     }
 
-    /// Finish renaming — issues ALTER TABLE if name changed.
-    pub fn finish_rename(&mut self, conn: &Connection) -> Result<(), String> {
+    /// Finish renaming -- issues ALTER TABLE if name changed.
+    pub fn finish_rename(&mut self, db: &dyn Db) -> Result<(), String> {
         self.renaming = false;
         if let Some(old) = self.rename_old.take() {
             if old != self.name {
                 let sql = format!("ALTER TABLE \"{}\" RENAME TO \"{}\"", old, self.name);
-                conn.execute_batch(&sql)
+                db.execute(&sql)
                     .map_err(|e| format!("Rename failed: {e}"))?;
             }
         }
         Ok(())
     }
 
-    pub fn refresh(&mut self, conn: &Connection) {
-        let sql = format!("SELECT rowid, * FROM \"{}\" LIMIT 10000", self.name);
-        if let Ok(mut stmt) = conn.prepare(&sql) {
-            if let Ok(mut result) = stmt.query([]) {
-                // column_count includes rowid, so actual data columns = count - 1
-                let total_cols = result.as_ref().unwrap().column_count();
-                let col_count = total_cols - 1;
-                let columns: Vec<String> = (0..col_count)
-                    .map(|i| {
-                        result
-                            .as_ref()
-                            .unwrap()
-                            .column_name(i + 1)
-                            .map_or("?".to_string(), |v| v.to_string())
-                    })
-                    .collect();
-
-                let mut rows = Vec::new();
-                let mut row_ids = Vec::new();
-                while let Ok(Some(row)) = result.next() {
-                    let rid: i64 = row.get::<_, i64>(0).unwrap_or(0);
-                    row_ids.push(rid);
-                    let mut vals = Vec::with_capacity(col_count);
-                    for i in 0..col_count {
-                        let val: String = row
-                            .get::<_, duckdb::types::Value>(i + 1)
-                            .map(|v| crate::bridge::format_value(&v))
-                            .unwrap_or_default();
-                        vals.push(val);
-                    }
-                    rows.push(vals);
-                }
-
-                self.data = TableData { columns, rows, row_ids };
+    pub fn refresh(&mut self, db: &dyn Db) {
+        if self.pending_batch.is_some() {
+            return;
+        }
+        let query = format!("SELECT rowid, * FROM \"{}\" LIMIT 10000", self.name);
+        match db.batch(&[], Some(&query)) {
+            Ok(result) if !result.columns.is_empty() => {
+                self.data = bridge::parse_rowid_result(result);
             }
+            Ok(_) => {
+                self.pending_batch = Some((vec![], query));
+            }
+            Err(_) => {}
         }
     }
 
@@ -126,7 +107,19 @@ impl TableWindow {
     }
 
     /// Render this table as a floating egui::Window. Returns false if closed.
-    pub fn show(&mut self, ctx: &egui::Context, conn: &Connection) -> bool {
+    pub fn show(&mut self, ctx: &egui::Context, db: &dyn Db) -> bool {
+        // Poll pending async batch operation
+        if let Some((stmts, query)) = self.pending_batch.clone() {
+            match db.batch(&stmts, Some(&query)) {
+                Ok(result) if !result.columns.is_empty() => {
+                    self.data = bridge::parse_rowid_result(result);
+                    self.pending_batch = None;
+                }
+                Ok(_) => { ctx.request_repaint(); }
+                Err(_) => { self.pending_batch = None; }
+            }
+        }
+
         let mut open = self.open;
         let width = self.estimate_width(ctx);
 
@@ -194,6 +187,11 @@ impl TableWindow {
                                     if label_resp.double_clicked() || header_resp.double_clicked() {
                                         new_editing_col = Some((ci, col_name.clone()));
                                     }
+                                    let hovered = ui.rect_contains_pointer(ui.max_rect());
+                                    let x_resp = ui.add_visible(hovered, egui::Button::new(egui_phosphor::regular::X).small().fill(egui::Color32::from_rgb(255, 180, 180)));
+                                    if x_resp.clicked() {
+                                        actions.push(TableAction::DropColumn(ci));
+                                    }
                                     header_resp.context_menu(|ui| {
                                         if ui.button("Rename column").clicked() {
                                             new_editing_col = Some((ci, self.data.columns[ci].clone()));
@@ -212,7 +210,7 @@ impl TableWindow {
                             });
                         }
                         header.col(|ui| {
-                            if ui.small_button(egui_phosphor::regular::PLUS).clicked() {
+                            if ui.small_button(format!("{} col", egui_phosphor::regular::PLUS)).clicked() {
                                 actions.push(TableAction::AddColumn);
                             }
                         });
@@ -266,7 +264,7 @@ impl TableWindow {
                                     row_hovered = true;
                                 }
                                 if let Some(&rid) = self.data.row_ids.get(ri) {
-                                    let x_resp = ui.add_visible(row_hovered, egui::Button::new(egui_phosphor::regular::X).small());
+                                    let x_resp = ui.add_visible(row_hovered, egui::Button::new(egui_phosphor::regular::X).small().fill(egui::Color32::from_rgb(255, 180, 180)));
                                     if x_resp.clicked() {
                                         actions.push(TableAction::DeleteRow(rid));
                                     }
@@ -282,63 +280,71 @@ impl TableWindow {
         self.editing_cell = new_editing;
         self.editing_col = new_editing_col;
 
-        // Apply cell edits to DuckDB
+        // Apply cell edits
         for (ri, ci, new_val) in edits {
             if let Some(&rid) = self.data.row_ids.get(ri) {
                 let col = &self.data.columns[ci];
+                let escaped = new_val.replace('\'', "''");
                 let sql = format!(
-                    "UPDATE \"{}\" SET \"{}\" = $1 WHERE rowid = $2",
-                    self.name, col
+                    "UPDATE \"{}\" SET \"{}\" = '{}' WHERE rowid = {}",
+                    self.name, col, escaped, rid
                 );
-                if let Ok(mut stmt) = conn.prepare(&sql) {
-                    let _ = stmt.execute(duckdb::params![new_val, rid]);
-                }
+                let _ = db.execute(&sql);
             }
         }
 
-        // Execute structural actions
+        // Execute structural actions using batch to preserve ordering
         for action in actions {
-            match action {
+            let mutation_sql = match &action {
                 TableAction::AddColumn => {
                     let new_col = format!("col_{}", self.data.columns.len());
-                    let sql = format!(
+                    format!(
                         "ALTER TABLE \"{}\" ADD COLUMN \"{}\" VARCHAR",
                         self.name, new_col
-                    );
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    )
                 }
                 TableAction::DropColumn(ci) => {
-                    if let Some(col) = self.data.columns.get(ci) {
-                        let sql = format!(
+                    if let Some(col) = self.data.columns.get(*ci) {
+                        format!(
                             "ALTER TABLE \"{}\" DROP COLUMN \"{}\"",
                             self.name, col
-                        );
-                        let _ = conn.execute_batch(&sql);
-                        self.refresh(conn);
+                        )
+                    } else {
+                        continue;
                     }
                 }
                 TableAction::RenameColumn(_ci, old, new) => {
-                    let sql = format!(
+                    format!(
                         "ALTER TABLE \"{}\" RENAME COLUMN \"{}\" TO \"{}\"",
                         self.name, old, new
-                    );
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    )
                 }
                 TableAction::AddRow => {
-                    let sql = format!("INSERT INTO \"{}\" DEFAULT VALUES", self.name);
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    format!("INSERT INTO \"{}\" DEFAULT VALUES", self.name)
                 }
                 TableAction::DeleteRow(rid) => {
-                    let sql = format!(
+                    format!(
                         "DELETE FROM \"{}\" WHERE rowid = {}",
                         self.name, rid
-                    );
-                    let _ = conn.execute_batch(&sql);
-                    self.refresh(conn);
+                    )
                 }
+            };
+
+            // Use batch: run mutation then re-query the table
+            let refresh_query = format!(
+                "SELECT rowid, * FROM \"{}\" LIMIT 10000",
+                self.name
+            );
+            let stmts = vec![mutation_sql];
+            match db.batch(&stmts, Some(&refresh_query)) {
+                Ok(result) if !result.columns.is_empty() => {
+                    self.data = bridge::parse_rowid_result(result);
+                }
+                Ok(_) => {
+                    // WASM: result pending, poll next frame
+                    self.pending_batch = Some((stmts, refresh_query));
+                }
+                Err(_) => {}
             }
         }
 

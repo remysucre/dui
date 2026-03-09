@@ -9,7 +9,7 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    eframe::run_native("dui", options, Box::new(|cc| Ok(Box::new(dui::app::DuiApp::new(cc)))))
+    eframe::run_native("¿Qué?", options, Box::new(|cc| Ok(Box::new(que::app::QueApp::new(cc)))))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -34,7 +34,7 @@ fn main() {
             .start(
                 canvas,
                 eframe::WebOptions::default(),
-                Box::new(|cc| Ok(Box::new(dui::app::DuiApp::new(cc)))),
+                Box::new(|cc| Ok(Box::new(que::app::QueApp::new(cc)))),
             )
             .await;
 

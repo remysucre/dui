@@ -1,7 +1,7 @@
-use dui::bridge;
-use dui::db::{Db, NativeDb};
-use dui::query_window::QueryWindow;
-use dui::table_view::TableWindow;
+use que::bridge;
+use que::db::{Db, NativeDb};
+use que::query_window::QueryWindow;
+use que::table_view::TableWindow;
 use eframe::egui;
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -15,7 +15,7 @@ fn empty_state() {
     let mut harness = egui_kittest::Harness::new_ui(|ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(40.0);
-            ui.heading("dui");
+            ui.heading("¿Qué?");
             ui.add_space(8.0);
             ui.label("Drop a data file here");
         });

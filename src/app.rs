@@ -4,7 +4,7 @@ use crate::query_window::QueryWindow;
 use crate::table_view::TableWindow;
 use eframe::egui;
 
-pub struct DuiApp {
+pub struct QueApp {
     db: Box<dyn Db>,
     tables: Vec<TableWindow>,
     next_table_id: usize,
@@ -14,7 +14,7 @@ pub struct DuiApp {
     pending_loads: Vec<(String, String)>,
 }
 
-impl DuiApp {
+impl QueApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
@@ -100,7 +100,7 @@ impl DuiApp {
     }
 }
 
-impl eframe::App for DuiApp {
+impl eframe::App for QueApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_dropped_files(ctx);
 
@@ -268,7 +268,7 @@ impl eframe::App for DuiApp {
             if !has_tables {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
-                    ui.heading("dui");
+                    ui.heading("¿Qué?");
                     ui.add_space(8.0);
                     if !self.db.is_ready() {
                         if let Some(err) = self.db.init_error() {

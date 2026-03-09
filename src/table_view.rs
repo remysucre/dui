@@ -14,12 +14,15 @@ pub struct TableWindow {
     pub renaming: bool,
     /// Pending async batch operation: (stmts, final_query)
     pending_batch: Option<(Vec<String>, String)>,
+    /// Column names as last committed to DB (for detecting renames)
+    committed_columns: Vec<String>,
 }
 
 static NEXT_TABLE_WINDOW_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
 impl TableWindow {
     pub fn new(name: String, data: TableData) -> Self {
+        let committed_columns = data.columns.clone();
         Self {
             id: NEXT_TABLE_WINDOW_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             name,
@@ -28,6 +31,7 @@ impl TableWindow {
             open: true,
             renaming: false,
             pending_batch: None,
+            committed_columns,
         }
     }
 
@@ -98,6 +102,7 @@ impl TableWindow {
             match db.batch(&stmts, Some(&query)) {
                 Ok(result) if !result.columns.is_empty() => {
                     self.data = bridge::parse_rowid_result(result);
+                    self.committed_columns = self.data.columns.clone();
                     self.pending_batch = None;
                 }
                 Ok(_) => { ctx.request_repaint_after(std::time::Duration::from_millis(16)); }
@@ -107,13 +112,14 @@ impl TableWindow {
 
         let mut open = self.open;
         let width = self.estimate_width(ctx);
+        let mut renames: Vec<(String, String)> = Vec::new();
 
         let window_frame = egui::Frame::window(&ctx.style())
             .inner_margin(egui::Margin::same(2));
         egui::Window::new(&self.name)
             .id(egui::Id::new(("table_window", self.id)))
             .open(&mut open)
-            .default_width(width)
+            .default_width(width.min(800.0))
             .resizable(true)
             .collapsible(true)
             .frame(window_frame)
@@ -125,21 +131,30 @@ impl TableWindow {
                     .size
                     .max(ui.spacing().interact_size.y);
 
+                egui::ScrollArea::horizontal().show(ui, |ui| {
                 let mut table = TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .min_scrolled_height(0.0)
-                    .max_scroll_height(400.0);
+                    .max_scroll_height(400.0)
+                    .auto_shrink([true, false]);
 
                 for _ in &self.data.columns {
-                    table = table.column(Column::auto().at_least(40.0).resizable(true));
+                    table = table.column(Column::auto().at_least(40.0).at_most(300.0).resizable(true).clip(true));
                 }
                 table
                     .header(20.0, |mut header| {
                         for ci in 0..self.data.columns.len() {
                             header.col(|ui| {
-                                ui.strong(&self.data.columns[ci]);
+                                let col = &mut self.data.columns[ci];
+                                let resp = ui.text_edit_singleline(col);
+                                if resp.lost_focus() {
+                                    let old = &self.committed_columns[ci];
+                                    if col != old {
+                                        renames.push((old.clone(), col.clone()));
+                                    }
+                                }
                             });
                         }
                     })
@@ -155,8 +170,36 @@ impl TableWindow {
                             }
                         });
                     });
+                }); // end ScrollArea
                 ui.label(format!("{} rows", row_count));
             });
+
+        // Issue column renames
+        for (old, new) in renames {
+            let sql = format!(
+                "ALTER TABLE \"{}\" RENAME COLUMN \"{}\" TO \"{}\"",
+                self.name, old, new
+            );
+            let refresh_query = format!(
+                "SELECT rowid, * FROM \"{}\" LIMIT 10000",
+                self.name
+            );
+            let stmts = vec![sql];
+            match db.batch(&stmts, Some(&refresh_query)) {
+                Ok(result) if !result.columns.is_empty() => {
+                    self.data = bridge::parse_rowid_result(result);
+                    self.committed_columns = self.data.columns.clone();
+                }
+                Ok(_) => {
+                    self.pending_batch = Some((stmts, refresh_query));
+                }
+                Err(_) => {
+                    // Revert the column name on failure
+                    self.data.columns = self.committed_columns.clone();
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
 
         self.open = open;
         open
